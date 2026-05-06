@@ -1,18 +1,71 @@
 import asyncio
-import json
-import os
-
 import cv2
+import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+relay = MediaRelay()
+pcs = set()
 
-# Enable CORS for frontend
+class CameraStreamTrack(VideoStreamTrack):
+    """
+    A synthetic video stream track for testing.
+    """
+    def __init__(self):
+        super().__init__()
+        print("Initializing Synthetic Video Track...")
+        self.count = 0
+        self.width = 640
+        self.height = 480
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+        
+        # Create a synthetic frame (bouncing ball)
+        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        
+        # Bouncing ball logic
+        c = (self.count * 5) % self.width
+        r = int(self.height / 2 + 50 * np.sin(self.count / 10))
+        cv2.circle(frame, (c, r), 30, (0, 255, 0), -1)
+        
+        cv2.putText(frame, f"TEST PATTERN - FRAME {self.count}", (50, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        # Add timestamp
+        import datetime
+        cv2.putText(frame, str(datetime.datetime.now()), (50, 430), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+            
+        new_frame = VideoFrame.from_ndarray(frame, format="rgb24")
+        new_frame.pts = pts
+        new_frame.time_base = time_base
+        self.count += 1
+        
+        if self.count % 100 == 0:
+            print(f"DEBUG: Sent {self.count} synthetic frames")
+            
+        return new_frame
+
+    def stop(self):
+        super().stop()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    yield
+    # Shutdown logic: close peer connections
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+
+app = FastAPI(lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,69 +74,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-relay = MediaRelay()
-
-class CameraStreamTrack(VideoStreamTrack):
-    """
-    A video stream track that yields frames from the camera.
-    """
-    def __init__(self):
-        super().__init__()
-        self.cap = cv2.VideoCapture(0)
-
-    async def recv(self):
-        pts, time_base = await self.next_timestamp()
-        
-        ret, frame = self.cap.read()
-        if not ret:
-            # If camera fails, send a black frame or repeat
-            return None
-            
-        new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        new_frame.pts = pts
-        new_frame.time_base = time_base
-        return new_frame
-
-pcs = set()
-
 @app.post("/offer")
 async def offer(request: Request):
-    params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    try:
+        params = await request.json()
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-    pc = RTCPeerConnection()
-    pcs.add(pc)
+        pc = RTCPeerConnection()
+        pcs.add(pc)
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        print("Connection state is %s" % pc.connectionState)
-        if pc.connectionState == "failed":
-            await pc.close()
-            pcs.discard(pc)
+        @pc.on("icecandidate")
+        def on_icecandidate(candidate):
+            if candidate:
+                print(f"DEBUG: Gathered ICE candidate: {candidate.foundation} {candidate.component} {candidate.protocol} {candidate.priority} {candidate.ip} {candidate.port} type {candidate.type}")
+            else:
+                print("DEBUG: ICE candidate gathering finished.")
 
-    # Add video track
-    pc.addTrack(CameraStreamTrack())
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            print(f"Connection state: {pc.connectionState}")
+            if pc.connectionState in ["failed", "closed"]:
+                await pc.close()
+                pcs.discard(pc)
 
-    # handle offer
-    await pc.setRemoteDescription(offer)
+        # Add video track
+        pc.addTrack(CameraStreamTrack())
 
-    # send answer
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
 
-    return JSONResponse(
-        content={
-            "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type,
-        }
-    )
+        # Wait for ICE gathering to complete
+        # This is important when not using trickle ICE
+        print("Gathering ICE candidates...")
+        # A simple way to wait for gathering to complete
+        # We can't easily await gathering specifically in aiortc without more complex logic, 
+        # but aiortc usually completes gathering during setLocalDescription or shortly after.
+        # Alternatively, we can use a small sleep or a more robust event listener.
+        
+        # Robust way to wait for gathering:
+        while pc.iceGatheringState != "complete":
+            await asyncio.sleep(0.1)
+        
+        print("ICE gathering complete.")
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    # close peer connections
-    coros = [pc.close() for pc in pcs]
-    await asyncio.gather(*coros)
-    pcs.clear()
+        return JSONResponse(
+            content={
+                "sdp": pc.localDescription.sdp,
+                "type": pc.localDescription.type,
+            }
+        )
+    except Exception as e:
+        print(f"Error handling offer: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
